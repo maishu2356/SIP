@@ -1,0 +1,33 @@
+//Code for Spectral tirad  (AS7265X)
+
+#include <Wire.h>
+#include "SparkFun_AS7265X.h"
+
+AS7265X sensor;
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  if (!sensor.begin()) {
+    Serial.println("Sensor not detected!");
+    while (1);
+  }
+
+  Serial.println("AS7265x Spectral Sensor Ready!");
+}
+
+void loop() {
+  sensor.takeMeasurements();  // Read all channels
+
+  Serial.print("A: "); Serial.println(sensor.getCalibratedA());
+  Serial.print("B: "); Serial.println(sensor.getCalibratedB());
+  Serial.print("C: "); Serial.println(sensor.getCalibratedC());
+  Serial.print("D: "); Serial.println(sensor.getCalibratedD());
+  Serial.print("E: "); Serial.println(sensor.getCalibratedE());
+  Serial.print("F: "); Serial.println(sensor.getCalibratedF());
+
+  Serial.println("----------------------");
+
+  delay(2000);
+}
