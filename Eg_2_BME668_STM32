@@ -1,0 +1,190 @@
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+
+/* --- FUNCTION PROTOTYPES --- */
+void SystemClock_Config(void);
+void MX_GPIO_Init(void);
+void MX_I2C1_Init(void);
+void MX_USART1_UART_Init(void);
+void Error_Handler(void);
+
+/* --- HANDLES --- */
+I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart1;
+
+#define BME280_ADDR (0x77 << 1)
+
+typedef struct {
+    uint16_t T1; int16_t T2, T3;
+    uint16_t P1; int16_t P2, P3, P4, P5, P6, P7, P8, P9;
+    uint8_t H1; int16_t H2; uint8_t H3; int16_t H4, H5; int8_t H6;
+    int32_t t_fine;
+} BME_Calib;
+
+BME_Calib cal;
+
+void uart_print(char *msg) {
+    HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+}
+
+/* Single-byte read for high stability */
+uint8_t read_reg(uint8_t reg) {
+    uint8_t val = 0;
+    HAL_I2C_Mem_Read(&hi2c1, BME280_ADDR, reg, 1, &val, 1, 100);
+    return val;
+}
+
+void BME280_ReadCalib(void) {
+    // Temperature
+    cal.T1 = (read_reg(0x89) << 8) | read_reg(0x88);
+    cal.T2 = (int16_t)((read_reg(0x8B) << 8) | read_reg(0x8A));
+    cal.T3 = (int16_t)((read_reg(0x8D) << 8) | read_reg(0x8C));
+
+    // Pressure
+    cal.P1 = (read_reg(0x8F) << 8) | read_reg(0x8E);
+    cal.P2 = (int16_t)((read_reg(0x91) << 8) | read_reg(0x90));
+    cal.P3 = (int16_t)((read_reg(0x93) << 8) | read_reg(0x92));
+    cal.P4 = (int16_t)((read_reg(0x95) << 8) | read_reg(0x94));
+    cal.P5 = (int16_t)((read_reg(0x97) << 8) | read_reg(0x96));
+    cal.P6 = (int16_t)((read_reg(0x99) << 8) | read_reg(0x98));
+    cal.P7 = (int16_t)((read_reg(0x9B) << 8) | read_reg(0x9A));
+    cal.P8 = (int16_t)((read_reg(0x9D) << 8) | read_reg(0x9C));
+    cal.P9 = (int16_t)((read_reg(0x9F) << 8) | read_reg(0x9E));
+
+    // Humidity
+    cal.H1 = read_reg(0xA1);
+    cal.H2 = (int16_t)((read_reg(0xE2) << 8) | read_reg(0xE1));
+    cal.H3 = read_reg(0xE3);
+    
+    uint8_t e4 = read_reg(0xE4);
+    uint8_t e5 = read_reg(0xE5);
+    uint8_t e6 = read_reg(0xE6);
+    
+    cal.H4 = (int16_t)((e4 << 4) | (e5 & 0x0F));
+    cal.H5 = (int16_t)((e6 << 4) | (e5 >> 4));
+    cal.H6 = (int8_t)read_reg(0xE7);
+}
+
+int32_t BME280_CompTemp(int32_t adc_T) {
+    int32_t v1 = ((((adc_T >> 3) - ((int32_t)cal.T1 << 1))) * ((int32_t)cal.T2)) >> 11;
+    /* Fixed typo here: changed calib.T1 to cal.T1 */
+    int32_t v2 = (((((adc_T >> 4) - ((int32_t)cal.T1)) * ((adc_T >> 4) - ((int32_t)cal.T1))) >> 12) * ((int32_t)cal.T3)) >> 14;
+    cal.t_fine = v1 + v2;
+    return (cal.t_fine * 5 + 128) >> 8;
+}
+
+uint32_t BME280_CompPress(int32_t adc_P) {
+    int64_t v1 = ((int64_t)cal.t_fine) - 128000;
+    int64_t v2 = v1 * v1 * (int64_t)cal.P6;
+    v2 = v2 + ((v1 * (int64_t)cal.P5) << 17);
+    v2 = v2 + (((int64_t)cal.P4) << 35);
+    v1 = ((v1 * v1 * (int64_t)cal.P3) >> 8) + ((v1 * (int64_t)cal.P2) << 12);
+    v1 = (((((int64_t)1) << 47) + v1)) * ((int64_t)cal.P1) >> 33;
+    if (v1 == 0) return 0;
+    int64_t p = 1048576 - adc_P;
+    p = (((p << 31) - v2) * 3125) / v1;
+    v1 = (((int64_t)cal.P9) * (p >> 13) * (p >> 13)) >> 25;
+    v2 = (((int64_t)cal.P8) * p) >> 19;
+    p = ((p + v1 + v2) >> 8) + (((int64_t)cal.P7) << 4);
+    return (uint32_t)(p >> 8);
+}
+
+uint32_t BME280_CompHum(int32_t adc_H) {
+    int32_t v1 = (cal.t_fine - ((int32_t)76800));
+    v1 = (((((adc_H << 14) - (((int32_t)cal.H4) << 20) - (((int32_t)cal.H5) * v1)) + 16384) >> 15) * (((((((v1 * ((int32_t)cal.H6)) >> 10) * (((v1 * ((int32_t)cal.H3)) >> 11) + 32768)) >> 10) + 2097152) * ((int32_t)cal.H2) + 8192) >> 14));
+    v1 = (v1 - (((((v1 >> 15) * (v1 >> 15)) >> 7) * ((int32_t)cal.H1)) >> 4));
+    v1 = (v1 < 0 ? 0 : v1);
+    v1 = (v1 > 419430400 ? 419430400 : v1);
+    return (uint32_t)(v1 >> 12);
+}
+
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+    MX_I2C1_Init();
+
+    uart_print("--- BME280 READY ---\r\n");
+    uint8_t rst = 0xB6;
+    HAL_I2C_Mem_Write(&hi2c1, BME280_ADDR, 0xE0, 1, &rst, 1, 100);
+    HAL_Delay(200);
+
+    BME280_ReadCalib();
+
+    while (1) {
+        uint8_t h_set = 0x01; 
+        HAL_I2C_Mem_Write(&hi2c1, BME280_ADDR, 0xF2, 1, &h_set, 1, 100);
+        uint8_t m_set = 0x27; 
+        HAL_I2C_Mem_Write(&hi2c1, BME280_ADDR, 0xF4, 1, &m_set, 1, 100);
+        HAL_Delay(100);
+
+        uint8_t d[8];
+        if (HAL_I2C_Mem_Read(&hi2c1, BME280_ADDR, 0xF7, 1, d, 8, 100) == HAL_OK) {
+            int32_t ap = (d[0]<<12)|(d[1]<<4)|(d[2]>>4);
+            int32_t at = (d[3]<<12)|(d[4]<<4)|(d[5]>>4);
+            int32_t ah = (d[6]<<8)|d[7];
+
+            int32_t t = BME280_CompTemp(at);
+            uint32_t p = BME280_CompPress(ap);
+            uint32_t h = BME280_CompHum(ah);
+
+            char buf[128];
+            sprintf(buf, "T: %ld.%02ld C | P: %ld.%02ld hPa | H: %ld.%01ld %%\r\n",
+                    t/100, (t<0?-t:t)%100, p/100, p%100, h/1024, ((h%1024)*10)/1024);
+            uart_print(buf);
+        }
+        HAL_Delay(1000);
+    }
+}
+
+/* --- PERIPHERAL INITIALIZATION --- */
+
+void SystemClock_Config(void) {
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+    osc.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+    osc.MSIState = RCC_MSI_ON;
+    osc.MSIClockRange = RCC_MSIRANGE_6;
+    osc.PLL.PLLState = RCC_PLL_ON;
+    osc.PLL.PLLSource = RCC_PLLSOURCE_MSI;
+    osc.PLL.PLLM = 1; osc.PLL.PLLN = 40; osc.PLL.PLLR = RCC_PLLR_DIV2;
+    HAL_RCC_OscConfig(&osc);
+    clk.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK|RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_4);
+}
+
+void MX_I2C1_Init(void) {
+    __HAL_RCC_I2C1_CLK_ENABLE();
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.Timing = 0x10909CEC;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    HAL_I2C_Init(&hi2c1);
+}
+
+void MX_USART1_UART_Init(void) {
+    __HAL_RCC_USART1_CLK_ENABLE();
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 115200;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    HAL_UART_Init(&huart1);
+}
+
+void MX_GPIO_Init(void) {
+    GPIO_InitTypeDef g = {0};
+    __HAL_RCC_GPIOB_CLK_ENABLE(); 
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    g.Pin = GPIO_PIN_6|GPIO_PIN_7; g.Mode = GPIO_MODE_AF_OD; g.Pull = GPIO_PULLUP; g.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &g);
+    g.Pin = GPIO_PIN_9|GPIO_PIN_10; g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_NOPULL; g.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &g);
+}
+
+void Error_Handler(void) {
+    __disable_irq();
+    while (1);
+}
